@@ -52,6 +52,7 @@ class TrayMenu(QMenu):
 class Window(QWidget):
     def __init__(self, start_services=True):
         super().__init__()
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         self.setWindowTitle('FormulaSnip · 截图识别')
         self.resize(1120, 820); self.setMinimumSize(930, 700)
         self.capture = self.engine = self.job = self.current_image = None
@@ -60,6 +61,7 @@ class Window(QWidget):
         self.ready = self.shutting_down = self.pending_capture = False
         self.loaded_modes = set()
         self.queued_job = None
+        self.session_active = False
         self.settings_path = env.ROOT / 'data/settings.json'
         try:
             self.settings = json.loads(self.settings_path.read_text(encoding='utf-8'))
@@ -124,7 +126,7 @@ class Window(QWidget):
         self.hold.valueChanged.connect(lambda value: self.duration_value.setText(f'{value} 毫秒'))
         release_tip = QLabel('按住后松开，即可呼出'); release_tip.setObjectName('muted'); side.addWidget(release_tip); side.addSpacing(14)
         shortcut = QLabel('Ctrl + Alt + L  呼出\nCtrl + Alt + Esc  取消'); shortcut.setObjectName('muted'); side.addWidget(shortcut); side.addSpacing(14)
-        hide = QPushButton('收起到托盘'); hide.clicked.connect(self.hide); side.addWidget(hide)
+        hide = QPushButton('收起到托盘'); hide.clicked.connect(self.suspend_panel); side.addWidget(hide)
         exit_button = QPushButton('退出软件'); exit_button.setObjectName('quiet'); exit_button.clicked.connect(self.quit); side.addWidget(exit_button)
         outer.addWidget(sidebar)
         main = QVBoxLayout(); main.setContentsMargins(36, 32, 36, 26); main.setSpacing(18); outer.addLayout(main, 1)
@@ -134,7 +136,7 @@ class Window(QWidget):
         actions = QHBoxLayout()
         self.snip = QPushButton('截图 / 框选区域'); self.snip.setObjectName('primary'); self.snip.clicked.connect(self.begin_capture); actions.addWidget(self.snip)
         self.open_image = QPushButton('打开图片'); self.open_image.clicked.connect(self.choose_image); actions.addWidget(self.open_image)
-        self.cancel = QPushButton('取消'); self.cancel.clicked.connect(self.cancel_work); self.cancel.setVisible(False); actions.addWidget(self.cancel)
+        self.cancel = QPushButton('取消'); self.cancel.clicked.connect(lambda: self.cancel_work()); self.cancel.setVisible(False); actions.addWidget(self.cancel)
         actions.addStretch(); main.addLayout(actions)
         split = QSplitter(Qt.Vertical)
         preview_container = QWidget(); p_layout = QVBoxLayout(preview_container); p_layout.setContentsMargins(0, 0, 0, 0)
@@ -149,7 +151,7 @@ class Window(QWidget):
         r_layout.addLayout(row)
         self.output = QPlainTextEdit(); self.output.setPlaceholderText('识别结果会显示在这里。可以直接修改，再复制使用。'); r_layout.addWidget(self.output)
         split.addWidget(results); split.setSizes([200, 330]); main.addWidget(split, 1)
-        self.status = QLabel('可以截图识别。模型按需加载，识别后自动释放。'); self.status.setObjectName('muted'); self.status.setWordWrap(True); main.addWidget(self.status)
+        self.status = QLabel('呼出后加载模型，关闭窗口后释放。'); self.status.setObjectName('muted'); self.status.setWordWrap(True); main.addWidget(self.status)
         self.enabled.toggled.connect(self.save_settings); self.hold.valueChanged.connect(self.save_settings)
         self.output.textChanged.connect(lambda: self.copy.setEnabled(bool(self.output.toPlainText().strip())))
         icon = QPixmap(64, 64); icon.fill(QColor('#4169e1')); painter = QPainter(icon); painter.setPen(Qt.white)
@@ -211,6 +213,8 @@ class Window(QWidget):
                 self.ready = True
                 if self.queued_job:
                     payload = self.queued_job; self.queued_job = None; self.send(payload)
+                else:
+                    self.load_mode()
                 continue
             if not self.job or data.get('id') != self.job['id']: continue
             if kind == 'progress': self.status.setText(data['message'])
@@ -223,7 +227,6 @@ class Window(QWidget):
                 message = f'识别完成，用时 {data["seconds"]:.3f} 秒。' + data.get('warning', '')
                 self.status.setText(message if data['text'] else '没有识别到内容，请检查截图范围。')
                 self.complete_job(); LOG.info('Result: mode=%s seconds=%.3f items=%s', self.mode, data['seconds'], len(data['items']))
-                self.stop_engine()
             elif kind == 'error':
                 self.complete_job(); self.status.setText('识别失败：' + data['message']); LOG.error('Engine error: %s', data['message'])
                 self.stop_engine()
@@ -234,7 +237,9 @@ class Window(QWidget):
         self.watchdog.start(90000 if payload['action'] == 'load' else 60000); self.update_actions()
 
     def load_mode(self):
-        # Selecting a mode never allocates model memory.
+        if self.session_active and self.ready and not self.job and self.mode not in self.loaded_modes:
+            self.status.setText('正在加载' + MODES[self.mode][0] + '模型…')
+            self.send({'action': 'load', 'mode': self.mode})
         self.update_actions()
 
     def stop_engine(self):
@@ -262,7 +267,8 @@ class Window(QWidget):
         self.job = None; self.update_actions()
 
     def job_timeout(self):
-        self.cancel_work(); self.status.setText('处理超时，已取消并释放模型。可以重试或缩小截图范围。')
+        self.cancel_work(show=False); self.stop_engine(); self.show_panel(load=False)
+        self.status.setText('处理超时，已取消并释放模型。重新呼出可加载模型，也可打开图片重试。')
 
     def change_mode(self, mode):
         self.mode = mode; self.mode_buttons[mode].setChecked(True)
@@ -275,8 +281,8 @@ class Window(QWidget):
         self.settings_path.write_text(json.dumps(self.settings, ensure_ascii=False), encoding='utf-8')
 
     def update_actions(self):
-        busy = bool(self.job or self.queued_job) or self.engine is not None or self.capture is not None or self.pending_capture
-        self.snip.setEnabled(not busy); self.open_image.setEnabled(not busy)
+        busy = bool(self.job or self.queued_job) or (self.engine is not None and not self.ready) or self.capture is not None or self.pending_capture
+        self.snip.setEnabled(self.ready and not busy); self.open_image.setEnabled(not busy)
         self.retry.setEnabled(not busy and self.current_image is not None); self.cancel.setVisible(busy)
         for button in self.mode_buttons.values(): button.setEnabled(not busy)
 
@@ -301,12 +307,26 @@ class Window(QWidget):
             if self.settings['enabled'] and not self.right_moved and elapsed >= self.settings['hold_ms'] / 1000 and self.capture is None and not self.pending_capture:
                 QTimer.singleShot(60, self.show_panel)
 
-    def show_panel(self):
+    def show_panel(self, load=True):
         if self.capture is not None or self.pending_capture or self.shutting_down: return
+        self.session_active = True
         self.showNormal(); self.raise_(); self.activateWindow()
+        if load:
+            if self.engine is None:
+                self.status.setText('正在启动识别服务并加载模型…')
+                self.watchdog.start(90000); self.start_engine()
+            else:
+                self.load_mode()
+
+    def suspend_panel(self):
+        self.session_active = False
+        self.cancel_work(show=False)
+        self.stop_engine()
+        self.hide()
+        self.status.setText('模型已释放。再次呼出时重新加载。')
 
     def begin_capture(self):
-        if self.engine is not None or self.job or self.queued_job or self.capture is not None or self.pending_capture: return
+        if self.job or self.queued_job or self.capture is not None or self.pending_capture or not self.ready: return
         self.pending_capture = True; self.update_actions(); self.hide(); QTimer.singleShot(300, self.open_capture)
 
     def open_capture(self):
@@ -350,32 +370,39 @@ class Window(QWidget):
         if hasattr(self, 'preview'): self.refresh_preview()
 
     def recognize_current(self):
-        if self.current_image is None or self.engine is not None or self.job or self.queued_job: return
+        if self.current_image is None or self.job or self.queued_job: return
         filename = 'job-' + uuid.uuid4().hex + '.png'
         if not self.current_image.save(str(env.ROOT / 'temp' / filename), 'PNG'):
             self.status.setText('无法创建临时截图，请检查 D 盘剩余空间。'); return
-        self.status.setText('正在启动识别并加载模型…')
-        self.queued_job = {'action': 'recognize', 'mode': self.mode, 'file': filename}
-        self.watchdog.start(90000); self.start_engine()
+        payload = {'action': 'recognize', 'mode': self.mode, 'file': filename}
+        if self.ready:
+            self.status.setText('正在识别…'); self.send(payload)
+        else:
+            self.status.setText('正在启动识别并加载模型…')
+            self.queued_job = payload
+            self.watchdog.start(90000); self.start_engine()
 
-    def cancel_work(self):
+    def cancel_work(self, show=True):
         self.pending_capture = False; self.capture_timeout.stop()
         if self.capture is not None:
             process = self.capture; self.capture = None
             if self.capture_guard: self.capture_guard.close(); self.capture_guard = None
             process.kill(); (env.ROOT / 'temp' / self.capture_file).unlink(missing_ok=True)
-        self.stop_engine()
-        self.complete_job(); self.show_panel(); self.status.setText('已取消，可以重新截图。')
+        if self.job or self.queued_job or (self.engine is not None and not self.ready):
+            self.stop_engine()
+        self.complete_job()
+        if show: self.show_panel()
+        if not self.job: self.status.setText('已取消，可以重新截图。')
 
     def copy_result(self):
         QApplication.clipboard().setText(self.output.toPlainText()); self.status.setText('结果已复制到剪贴板。')
 
     def closeEvent(self, event):
         if self.shutting_down: event.accept()
-        else: event.ignore(); self.hide()
+        else: event.ignore(); self.suspend_panel()
 
     def quit(self):
-        self.shutting_down = True; self.poll.stop(); self.cancel_work()
+        self.shutting_down = True; self.poll.stop(); self.cancel_work(show=False)
         if self.engine_guard: self.engine_guard.close(); self.engine_guard = None
         if self.engine: self.engine.kill()
         self.tray.hide(); QApplication.quit()
@@ -384,17 +411,23 @@ class Window(QWidget):
 def main():
     app = QApplication(sys.argv); app.setQuitOnLastWindowClosed(False)
     socket = QLocalSocket(); socket.connectToServer('FormulaSnip-local-v2')
-    if socket.waitForConnected(400): socket.write(b'show'); socket.waitForBytesWritten(400); return
+    background = '--background' in sys.argv
+    if socket.waitForConnected(400):
+        if not background: socket.write(b'show'); socket.waitForBytesWritten(400)
+        return
     QLocalServer.removeServer('FormulaSnip-local-v2')
     server = QLocalServer(); server.listen('FormulaSnip-local-v2')
     window = Window()
     def incoming():
         connection = server.nextPendingConnection()
-        if connection: connection.disconnectFromServer(); connection.deleteLater()
-        window.show_panel()
+        if connection:
+            connection.waitForReadyRead(400)
+            if bytes(connection.readAll()) == b'show': window.show_panel()
+            connection.disconnectFromServer(); connection.deleteLater()
     server.newConnection.connect(incoming)
     app.aboutToQuit.connect(lambda: window.engine_guard.close() if window.engine_guard else None)
-    window.show(); sys.exit(app.exec())
+    if not background: window.show_panel()
+    sys.exit(app.exec())
 
 
 if __name__ == '__main__': main()

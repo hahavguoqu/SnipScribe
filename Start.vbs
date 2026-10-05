@@ -9,4 +9,8 @@ processEnv("TMP") = root & "\temp"
 shell.CurrentDirectory = root
 uv = "uv"
 If fso.FileExists(root & "\tools\uv.exe") Then uv = Chr(34) & root & "\tools\uv.exe" & Chr(34)
-shell.Run uv & " run --frozen --no-sync python launch.py", 0, False
+args = ""
+If WScript.Arguments.Count > 0 Then
+    If WScript.Arguments(0) = "--background" Then args = " --background"
+End If
+shell.Run uv & " run --frozen --no-sync python launch.py" & args, 0, False
