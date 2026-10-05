@@ -1,0 +1,20 @@
+[project]
+name = "formulasnip"
+version = "0.1.0"
+description = "Local screenshot to LaTeX utility"
+requires-python = ">=3.11"
+dependencies = [
+    "ftfy>=6.3,<7",
+    "paddleocr==3.3.2",
+    "paddlepaddle==3.2.2",
+    "pillow>=11,<12",
+    "pyside6>=6.8,<7",
+    "tokenizers>=0.21,<0.22",
+]
+
+[project.scripts]
+formulasnip = "formulasnip:main"
+
+[build-system]
+requires = ["uv_build>=0.12.11,<0.13.0"]
+build-backend = "uv_build"
